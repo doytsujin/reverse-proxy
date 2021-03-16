@@ -30,7 +30,11 @@ namespace Yarp.ReverseProxy.Service.Proxy
         private static readonly Version DefaultVersion = HttpVersion.Version20;
 #if NET
         private static readonly HttpVersionPolicy DefaultVersionPolicy = HttpVersionPolicy.RequestVersionOrLower;
+        private static readonly HttpRequestOptionsKey<StreamCopyHttpContent> BodyKey = new("BodyKey");
+#else
+        private static readonly string BodyKey = "BodyKey";
 #endif
+
         private readonly ILogger _logger;
         private readonly IClock _clock;
 
@@ -91,6 +95,7 @@ namespace Yarp.ReverseProxy.Service.Proxy
             HttpMessageInvoker httpClient,
             RequestProxyOptions requestOptions,
             HttpTransformer transformer)
+
         {
             _ = context ?? throw new ArgumentNullException(nameof(context));
             _ = destinationPrefix ?? throw new ArgumentNullException(nameof(destinationPrefix));
@@ -108,6 +113,246 @@ namespace Yarp.ReverseProxy.Service.Proxy
             ProxyTelemetry.Log.ProxyStart(destinationPrefix);
             try
             {
+                using var destinationRequest = CreateRequest(context, destinationPrefix, requestOptions, copyHeaders: true);
+                // TODO: Transform request
+                var (destinationResponse, proxyError) = await SendRequestAsync(context, destinationRequest, httpClient, requestOptions);
+                if (proxyError == ProxyError.None)
+                {
+                    // TODO: Transform response
+                    proxyError = await SendResponseAsync(context, destinationResponse, copyStatus: true, copyHeaders: true);
+                    if (proxyError == ProxyError.None)
+                    {
+                        // TODO: Transform trailers
+                        await CompleteResponseAsync(context, destinationResponse, copyTrailers: true);
+                    }
+                }
+            }
+            finally
+            {
+                ProxyTelemetry.Log.ProxyStop(context.Response.StatusCode);
+            }
+        }
+
+        public HttpRequestMessage CreateRequest(
+            HttpContext context,
+            string destinationPrefix,
+            RequestProxyOptions requestOptions,
+            bool copyHeaders)
+        {
+            _ = context ?? throw new ArgumentNullException(nameof(context));
+            _ = destinationPrefix ?? throw new ArgumentNullException(nameof(destinationPrefix));
+
+            var request = context.Request;
+            var requestAborted = context.RequestAborted;
+
+            var isClientHttp2 = ProtocolHelper.IsHttp2(request.Protocol);
+
+            // NOTE: We heuristically assume gRPC-looking requests may require streaming semantics.
+            // See https://github.com/microsoft/reverse-proxy/issues/118 for design discussion.
+            var isStreamingRequest = isClientHttp2 && ProtocolHelper.IsGrpcContentType(request.ContentType);
+
+            // :: Step 1-3: Create outgoing HttpRequestMessage
+            // "http://a".Length = 8
+            if (destinationPrefix == null || destinationPrefix.Length < 8)
+            {
+                throw new ArgumentException(nameof(destinationPrefix));
+            }
+
+            var destinationRequest = new HttpRequestMessage
+            {
+                Method = HttpUtilities.GetHttpMethod(request.Method)
+            };
+
+            var upgradeFeature = context.Features.Get<IHttpUpgradeFeature>();
+            var upgradeHeader = request.Headers[HeaderNames.Upgrade].ToString();
+            var isUpgradeRequest = (upgradeFeature?.IsUpgradableRequest ?? false)
+                // Mitigate https://github.com/microsoft/reverse-proxy/issues/255, IIS considers all requests upgradeable.
+                && (string.Equals("WebSocket", upgradeHeader, StringComparison.OrdinalIgnoreCase)
+                    // https://github.com/microsoft/reverse-proxy/issues/467 for kubernetes APIs
+                    || upgradeHeader.StartsWith("SPDY/", StringComparison.OrdinalIgnoreCase));
+
+            // Default to HTTP/1.1 for proxying upgradeable requests. This is already the default as of .NET Core 3.1
+            // Otherwise request what's set in proxyOptions (e.g. default HTTP/2) and let HttpClient negotiate the protocol
+            // based on VersionPolicy (for .NET 5 and higher). For example, downgrading to HTTP/1.1 if it cannot establish HTTP/2 with the target.
+            // This is done without extra round-trips thanks to ALPN. We can detect a downgrade after calling HttpClient.SendAsync
+            // (see Step 3 below). TBD how this will change when HTTP/3 is supported.
+            destinationRequest.Version = isUpgradeRequest ? ProtocolHelper.Http11Version : (requestOptions?.Version ?? DefaultVersion);
+#if NET
+            destinationRequest.VersionPolicy = isUpgradeRequest ? HttpVersionPolicy.RequestVersionOrLower : (requestOptions?.VersionPolicy ?? DefaultVersionPolicy);
+#endif
+            destinationRequest.RequestUri = RequestUtilities.MakeDestinationAddress(destinationPrefix, request.Path, request.QueryString);
+
+            // :: Step 2: Setup copy of request body (background) Client --► Proxy --► Destination
+            // Note that we must do this before step (3) because step (3) may also add headers to the HttpContent that we set up here.
+            var requestContent = SetupRequestBodyCopy(request, isStreamingRequest, requestAborted);
+            if (requestContent != null)
+            {
+                // TODO: What if they replace the HttpContent object? That would mess with our tracking and error handling.
+                destinationRequest.Content = requestContent;
+#if NET
+                destinationRequest.Options.Set(BodyKey, requestContent);
+#else
+                destinationRequest.Properties[BodyKey] = requestContent;
+#endif
+            }
+
+            // :: Step 3: Copy request headers Client --► Proxy --► Destination
+            if (copyHeaders)
+            {
+                RequestUtilities.CopyRequestHeaders(context, destinationRequest);
+            }
+
+            return destinationRequest;
+        }
+
+        public async ValueTask<(HttpResponseMessage, ProxyError)> SendRequestAsync(
+            HttpContext context,
+            HttpRequestMessage destinationRequest,
+            HttpMessageInvoker httpClient,
+            RequestProxyOptions requestOptions)
+        {
+            _ = context ?? throw new ArgumentNullException(nameof(context));
+            _ = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
+
+            // HttpClient overload for SendAsync changes response behavior to fully buffered which impacts performance
+            // See discussion in https://github.com/microsoft/reverse-proxy/issues/458
+            if (httpClient is HttpClient)
+            {
+                throw new ArgumentException($"The http client must be of type HttpMessageInvoker, not HttpClient", nameof(httpClient));
+            }
+
+            Log.Proxying(_logger, destinationRequest.RequestUri);
+            // :: Step 4: Send the outgoing request using HttpClient
+            HttpResponseMessage destinationResponse;
+            var requestAborted = context.RequestAborted;
+            var requestTimeoutSource = CancellationTokenSource.CreateLinkedTokenSource(requestAborted);
+            requestTimeoutSource.CancelAfter(requestOptions?.Timeout ?? DefaultTimeout);
+            var requestTimeoutToken = requestTimeoutSource.Token;
+            try
+            {
+                ProxyTelemetry.Log.ProxyStage(ProxyStage.SendAsyncStart);
+                destinationResponse = await httpClient.SendAsync(destinationRequest, requestTimeoutToken);
+                ProxyTelemetry.Log.ProxyStage(ProxyStage.SendAsyncStop);
+            }
+            catch (OperationCanceledException canceledException)
+            {
+                if (!requestAborted.IsCancellationRequested && requestTimeoutToken.IsCancellationRequested)
+                {
+                    ReportProxyError(context, ProxyError.RequestTimedOut, canceledException);
+                    context.Response.StatusCode = StatusCodes.Status504GatewayTimeout;
+                    return (null, ProxyError.RequestTimedOut);
+                }
+
+                ReportProxyError(context, ProxyError.RequestCanceled, canceledException);
+                context.Response.StatusCode = StatusCodes.Status502BadGateway;
+                return (null, ProxyError.RequestCanceled);
+            }
+            catch (Exception requestException)
+            {
+#if NET
+                destinationRequest.Options.TryGetValue(BodyKey, out var requestContent);
+#else
+                var requestContent = destinationRequest.Properties.TryGetValue(BodyKey, out var temp) ? (StreamCopyHttpContent)temp : null;
+#endif
+                await HandleRequestFailureAsync(context, requestContent, requestException);
+                return (null, ProxyError.RequestCanceled);
+            }
+            finally
+            {
+                requestTimeoutSource.Dispose();
+            }
+
+            return (destinationResponse, ProxyError.None);
+        }
+
+        public async ValueTask<ProxyError> SendResponseAsync(
+            HttpContext context,
+            HttpResponseMessage destinationResponse,
+            bool copyStatus,
+            bool copyHeaders)
+        {
+            _ = context ?? throw new ArgumentNullException(nameof(context));
+
+            var requestAborted = context.RequestAborted;
+
+            var isClientHttp2 = ProtocolHelper.IsHttp2(context.Request.Protocol);
+
+            // NOTE: We heuristically assume gRPC-looking requests may require streaming semantics.
+            // See https://github.com/microsoft/reverse-proxy/issues/118 for design discussion.
+            var isStreamingRequest = isClientHttp2 && ProtocolHelper.IsGrpcContentType(context.Request.ContentType);
+
+            // Detect connection downgrade, which may be problematic for e.g. gRPC.
+            if (isClientHttp2 && destinationResponse.Version.Major != 2)
+            {
+                // TODO: Do something on connection downgrade...
+                Log.HttpDowngradeDetected(_logger);
+            }
+
+            try
+            {
+                // :: Step 5: Copy response status line Client ◄-- Proxy ◄-- Destination
+                if (copyStatus)
+                {
+                    CopyResponseStatus(destinationResponse, context);
+                }
+
+                // :: Step 6: Copy response headers Client ◄-- Proxy ◄-- Destination
+                if (copyHeaders)
+                {
+                    RequestUtilities.CopyResponseHeaders(context, destinationResponse);
+                }
+            }
+            catch (Exception ex)
+            {
+                destinationResponse.Dispose();
+                // Clear the response since status code, reason and some headers might have already been copied and we want clean 502 response.
+                context.Response.Clear();
+                context.Response.StatusCode = StatusCodes.Status502BadGateway;
+                return ReportProxyError(context, ProxyError.ResponseHeaders, ex);
+            }
+
+            // :: Step 7-A: Check for a 101 upgrade response, this takes care of WebSockets as well as any other upgradeable protocol.
+            if (destinationResponse.StatusCode == HttpStatusCode.SwitchingProtocols)
+            {
+                return await HandleUpgradedResponse(context, destinationResponse, requestAborted);
+            }
+
+            // NOTE: it may *seem* wise to call `context.Response.StartAsync()` at this point
+            // since it looks like we are ready to send back response headers
+            // (and this might help reduce extra delays while we wait to receive the body from the destination).
+            // HOWEVER, this would produce the wrong result if it turns out that there is no content
+            // from the destination -- instead of sending headers and terminating the stream at once,
+            // we would send headers thinking a body may be coming, and there is none.
+            // This is problematic on gRPC connections when the destination server encounters an error,
+            // in which case it immediately returns the response headers and trailing headers, but no content,
+            // and clients misbehave if the initial headers response does not indicate stream end.
+
+#if NET
+            destinationResponse.RequestMessage.Options.TryGetValue(BodyKey, out var requestContent);
+#else
+            var requestContent = destinationResponse.RequestMessage.Properties.TryGetValue(BodyKey, out var temp) ? (StreamCopyHttpContent)temp : null;
+#endif
+
+            // :: Step 7-B: Copy response body Client ◄-- Proxy ◄-- Destination
+            var (responseBodyCopyResult, responseBodyException) = await CopyResponseBodyAsync(destinationResponse.Content, context.Response.Body, requestAborted);
+
+            if (responseBodyCopyResult != StreamCopyResult.Success)
+            {
+                return await HandleResponseBodyErrorAsync(context, requestContent, responseBodyCopyResult, responseBodyException);
+            }
+
+            return ProxyError.None;
+        }
+
+        public async ValueTask<ProxyError> CompleteResponseAsync(
+            HttpContext context,
+            HttpResponseMessage destinationResponse,
+            bool copyTrailers)
+        {
+            _ = context ?? throw new ArgumentNullException(nameof(context));
+
+            try
+            {
                 var requestAborted = context.RequestAborted;
 
                 var isClientHttp2 = ProtocolHelper.IsHttp2(context.Request.Protocol);
@@ -116,106 +361,17 @@ namespace Yarp.ReverseProxy.Service.Proxy
                 // See https://github.com/microsoft/reverse-proxy/issues/118 for design discussion.
                 var isStreamingRequest = isClientHttp2 && ProtocolHelper.IsGrpcContentType(context.Request.ContentType);
 
-                // :: Step 1-3: Create outgoing HttpRequestMessage
-                var (destinationRequest, requestContent) = await CreateRequestMessageAsync(
-                    context, destinationPrefix, transformer, requestOptions, isStreamingRequest, requestAborted);
 
-                // :: Step 4: Send the outgoing request using HttpClient
-                HttpResponseMessage destinationResponse;
-                var requestTimeoutSource = CancellationTokenSource.CreateLinkedTokenSource(requestAborted);
-                requestTimeoutSource.CancelAfter(requestOptions?.Timeout ?? DefaultTimeout);
-                var requestTimeoutToken = requestTimeoutSource.Token;
-                try
+#if NET
+                destinationResponse.RequestMessage.Options.TryGetValue(BodyKey, out var requestContent);
+#else
+                var requestContent = destinationResponse.RequestMessage.Properties.TryGetValue(BodyKey, out var temp) ? (StreamCopyHttpContent)temp : null;
+#endif
+                if (copyTrailers)
                 {
-                    ProxyTelemetry.Log.ProxyStage(ProxyStage.SendAsyncStart);
-                    destinationResponse = await httpClient.SendAsync(destinationRequest, requestTimeoutToken);
-                    ProxyTelemetry.Log.ProxyStage(ProxyStage.SendAsyncStop);
+                    // :: Step 8: Copy response trailer headers and finish response Client ◄-- Proxy ◄-- Destination
+                    CopyResponseTrailingHeaders(destinationResponse, context);
                 }
-                catch (OperationCanceledException canceledException)
-                {
-                    if (!requestAborted.IsCancellationRequested && requestTimeoutToken.IsCancellationRequested)
-                    {
-                        ReportProxyError(context, ProxyError.RequestTimedOut, canceledException);
-                        context.Response.StatusCode = StatusCodes.Status504GatewayTimeout;
-                        return;
-                    }
-
-                    ReportProxyError(context, ProxyError.RequestCanceled, canceledException);
-                    context.Response.StatusCode = StatusCodes.Status502BadGateway;
-                    return;
-                }
-                catch (Exception requestException)
-                {
-                    await HandleRequestFailureAsync(context, requestContent, requestException);
-                    return;
-                }
-                finally
-                {
-                    requestTimeoutSource.Dispose();
-                }
-
-                // Detect connection downgrade, which may be problematic for e.g. gRPC.
-                if (isClientHttp2 && destinationResponse.Version.Major != 2)
-                {
-                    // TODO: Do something on connection downgrade...
-                    Log.HttpDowngradeDetected(_logger);
-                }
-
-                // Assert that, if we are proxying content to the destination, it must have started by now
-                // (since HttpClient.SendAsync has already completed asynchronously).
-                // If this check fails, there is a coding defect which would otherwise
-                // cause us to wait forever in step 9, so fail fast here.
-                if (requestContent != null && !requestContent.Started)
-                {
-                    // TODO: HttpClient might not need to read the body in some scenarios, such as an early auth failure with Expect: 100-continue.
-                    // https://github.com/microsoft/reverse-proxy/issues/617
-                    throw new InvalidOperationException("Proxying the Client request body to the Destination server hasn't started. This is a coding defect.");
-                }
-
-                try
-                {
-                    // :: Step 5: Copy response status line Client ◄-- Proxy ◄-- Destination
-                    // :: Step 6: Copy response headers Client ◄-- Proxy ◄-- Destination
-                    await CopyResponseStatusAndHeadersAsync(destinationResponse, context, transformer);
-                }
-                catch (Exception ex)
-                {
-                    destinationResponse.Dispose();
-                    ReportProxyError(context, ProxyError.ResponseHeaders, ex);
-                    // Clear the response since status code, reason and some headers might have already been copied and we want clean 502 response.
-                    context.Response.Clear();
-                    context.Response.StatusCode = StatusCodes.Status502BadGateway;
-                    return;
-                }
-
-                // :: Step 7-A: Check for a 101 upgrade response, this takes care of WebSockets as well as any other upgradeable protocol.
-                if (destinationResponse.StatusCode == HttpStatusCode.SwitchingProtocols)
-                {
-                    await HandleUpgradedResponse(context, destinationResponse, requestAborted);
-                    return;
-                }
-
-                // NOTE: it may *seem* wise to call `context.Response.StartAsync()` at this point
-                // since it looks like we are ready to send back response headers
-                // (and this might help reduce extra delays while we wait to receive the body from the destination).
-                // HOWEVER, this would produce the wrong result if it turns out that there is no content
-                // from the destination -- instead of sending headers and terminating the stream at once,
-                // we would send headers thinking a body may be coming, and there is none.
-                // This is problematic on gRPC connections when the destination server encounters an error,
-                // in which case it immediately returns the response headers and trailing headers, but no content,
-                // and clients misbehave if the initial headers response does not indicate stream end.
-
-                // :: Step 7-B: Copy response body Client ◄-- Proxy ◄-- Destination
-                var (responseBodyCopyResult, responseBodyException) = await CopyResponseBodyAsync(destinationResponse.Content, context.Response.Body, requestAborted);
-
-                if (responseBodyCopyResult != StreamCopyResult.Success)
-                {
-                    await HandleResponseBodyErrorAsync(context, requestContent, responseBodyCopyResult, responseBodyException);
-                    return;
-                }
-
-                // :: Step 8: Copy response trailer headers and finish response Client ◄-- Proxy ◄-- Destination
-                await CopyResponseTrailingHeadersAsync(destinationResponse, context, transformer);
 
                 if (isStreamingRequest)
                 {
@@ -245,63 +401,17 @@ namespace Yarp.ReverseProxy.Service.Proxy
                             StreamCopyResult.Canceled => ProxyError.RequestBodyCanceled,
                             _ => throw new NotImplementedException(requestBodyCopyResult.ToString())
                         };
-                        ReportProxyError(context, error, requestBodyException);
+                        return ReportProxyError(context, error, requestBodyException);
                     }
                 }
             }
             finally
             {
                 ProxyTelemetry.Log.ProxyStop(context.Response.StatusCode);
-            }
-        }
-
-        private async ValueTask<(HttpRequestMessage, StreamCopyHttpContent)> CreateRequestMessageAsync(HttpContext context, string destinationPrefix,
-            HttpTransformer transformer, RequestProxyOptions requestOptions, bool isStreamingRequest, CancellationToken requestAborted)
-        {
-            // "http://a".Length = 8
-            if (destinationPrefix == null || destinationPrefix.Length < 8)
-            {
-                throw new ArgumentException(nameof(destinationPrefix));
+                destinationResponse.Dispose();
             }
 
-            var destinationRequest = new HttpRequestMessage();
-
-            destinationRequest.Method = HttpUtilities.GetHttpMethod(context.Request.Method);
-
-            var upgradeFeature = context.Features.Get<IHttpUpgradeFeature>();
-            var upgradeHeader = context.Request.Headers[HeaderNames.Upgrade].ToString();
-            var isUpgradeRequest = (upgradeFeature?.IsUpgradableRequest ?? false)
-                // Mitigate https://github.com/microsoft/reverse-proxy/issues/255, IIS considers all requests upgradeable.
-                && (string.Equals("WebSocket", upgradeHeader, StringComparison.OrdinalIgnoreCase)
-                    // https://github.com/microsoft/reverse-proxy/issues/467 for kubernetes APIs
-                    || upgradeHeader.StartsWith("SPDY/", StringComparison.OrdinalIgnoreCase));
-
-            // Default to HTTP/1.1 for proxying upgradeable requests. This is already the default as of .NET Core 3.1
-            // Otherwise request what's set in proxyOptions (e.g. default HTTP/2) and let HttpClient negotiate the protocol
-            // based on VersionPolicy (for .NET 5 and higher). For example, downgrading to HTTP/1.1 if it cannot establish HTTP/2 with the target.
-            // This is done without extra round-trips thanks to ALPN. We can detect a downgrade after calling HttpClient.SendAsync
-            // (see Step 3 below). TBD how this will change when HTTP/3 is supported.
-            destinationRequest.Version = isUpgradeRequest ? ProtocolHelper.Http11Version : (requestOptions?.Version ?? DefaultVersion);
-#if NET
-            destinationRequest.VersionPolicy = isUpgradeRequest ? HttpVersionPolicy.RequestVersionOrLower : (requestOptions?.VersionPolicy ?? DefaultVersionPolicy);
-#endif
-
-            // :: Step 2: Setup copy of request body (background) Client --► Proxy --► Destination
-            // Note that we must do this before step (3) because step (3) may also add headers to the HttpContent that we set up here.
-            var requestContent = SetupRequestBodyCopy(context.Request, isStreamingRequest, requestAborted);
-            destinationRequest.Content = requestContent;
-
-            // :: Step 3: Copy request headers Client --► Proxy --► Destination
-            await transformer.TransformRequestAsync(context, destinationRequest, destinationPrefix);
-
-            // Allow someone to custom build the request uri, otherwise provide a default for them.
-            var request = context.Request;
-            destinationRequest.RequestUri ??= RequestUtilities.MakeDestinationAddress(destinationPrefix, request.Path, request.QueryString);
-
-            Log.Proxying(_logger, destinationRequest.RequestUri);
-
-            // TODO: What if they replace the HttpContent object? That would mess with our tracking and error handling.
-            return (destinationRequest, requestContent);
+            return ProxyError.None;
         }
 
         private StreamCopyHttpContent SetupRequestBodyCopy(HttpRequest request, bool isStreamingRequest, CancellationToken cancellation)
@@ -387,7 +497,7 @@ namespace Yarp.ReverseProxy.Service.Proxy
             return requestContent;
         }
 
-        private void HandleRequestBodyFailure(HttpContext context, StreamCopyResult requestBodyCopyResult, Exception requestBodyException, Exception additionalException)
+        private ProxyError HandleRequestBodyFailure(HttpContext context, StreamCopyResult requestBodyCopyResult, Exception requestBodyException, Exception additionalException)
         {
             ProxyError requestBodyError;
             int statusCode;
@@ -422,13 +532,14 @@ namespace Yarp.ReverseProxy.Service.Proxy
                 // Nothing has been sent to the client yet, we can still send a good error response.
                 context.Response.Clear();
                 context.Response.StatusCode = statusCode;
-                return;
+                return requestBodyError;
             }
 
             ResetOrAbort(context, isCancelled: requestBodyCopyResult == StreamCopyResult.Canceled);
+            return requestBodyError;
         }
 
-        private async Task HandleRequestFailureAsync(HttpContext context, StreamCopyHttpContent requestContent, Exception requestException)
+        private async ValueTask<ProxyError> HandleRequestFailureAsync(HttpContext context, StreamCopyHttpContent requestContent, Exception requestException)
         {
             // Check for request body errors, these may have triggered the response error.
             if (requestContent?.ConsumptionTask.IsCompleted == true)
@@ -437,17 +548,16 @@ namespace Yarp.ReverseProxy.Service.Proxy
 
                 if (requestBodyCopyResult != StreamCopyResult.Success)
                 {
-                    HandleRequestBodyFailure(context, requestBodyCopyResult, requestBodyException, requestException);
-                    return;
+                    return HandleRequestBodyFailure(context, requestBodyCopyResult, requestBodyException, requestException);
                 }
             }
 
             // We couldn't communicate with the destination.
-            ReportProxyError(context, ProxyError.Request, requestException);
             context.Response.StatusCode = StatusCodes.Status502BadGateway;
+            return ReportProxyError(context, ProxyError.Request, requestException);
         }
 
-        private static Task CopyResponseStatusAndHeadersAsync(HttpResponseMessage source, HttpContext context, HttpTransformer transformer)
+        private static void CopyResponseStatus(HttpResponseMessage source, HttpContext context)
         {
             context.Response.StatusCode = (int)source.StatusCode;
 
@@ -459,12 +569,9 @@ namespace Yarp.ReverseProxy.Service.Proxy
                     context.Features.Get<IHttpResponseFeature>().ReasonPhrase = source.ReasonPhrase;
                 }
             }
-
-            // Copies headers
-            return transformer.TransformResponseAsync(context, source);
         }
 
-        private async Task HandleUpgradedResponse(HttpContext context, HttpResponseMessage destinationResponse,
+        private async ValueTask<ProxyError> HandleUpgradedResponse(HttpContext context, HttpResponseMessage destinationResponse,
             CancellationToken longCancellation)
         {
             ProxyTelemetry.Log.ProxyStage(ProxyStage.ResponseUpgrade);
@@ -487,8 +594,7 @@ namespace Yarp.ReverseProxy.Service.Proxy
             catch (Exception ex)
             {
                 destinationResponse.Dispose();
-                ReportProxyError(context, ProxyError.UpgradeResponseClient, ex);
-                return;
+                return ReportProxyError(context, ProxyError.UpgradeResponseClient, ex);
             }
             using var clientStream = upgradeResult;
 
@@ -508,31 +614,32 @@ namespace Yarp.ReverseProxy.Service.Proxy
             var (firstResult, firstException) = await firstTask;
             if (firstResult != StreamCopyResult.Success)
             {
-                ReportResult(context, requestFinishedFirst, firstResult, firstException);
+                var error = ReportResult(context, requestFinishedFirst, firstResult, firstException);
                 // Cancel the other direction
                 abortTokenSource.Cancel();
                 // Wait for this to finish before exiting so the resources get cleaned up properly.
                 await secondTask;
-            }
-            else
-            {
-                var (secondResult, secondException) = await secondTask;
-                if (secondResult != StreamCopyResult.Success)
-                {
-                    ReportResult(context, requestFinishedFirst, secondResult, secondException);
-                }
+                return error;
             }
 
-            void ReportResult(HttpContext context, bool reqeuest, StreamCopyResult result, Exception exception)
+            var (secondResult, secondException) = await secondTask;
+            if (secondResult != StreamCopyResult.Success)
+            {
+                return ReportResult(context, requestFinishedFirst, secondResult, secondException);
+            }
+
+            return ProxyError.None;
+
+            ProxyError ReportResult(HttpContext context, bool request, StreamCopyResult result, Exception exception)
             {
                 var error = result switch
                 {
-                    StreamCopyResult.InputError => reqeuest ? ProxyError.UpgradeRequestClient : ProxyError.UpgradeResponseDestination,
-                    StreamCopyResult.OutputError => reqeuest ? ProxyError.UpgradeRequestDestination : ProxyError.UpgradeResponseClient,
-                    StreamCopyResult.Canceled => reqeuest ? ProxyError.UpgradeRequestCanceled : ProxyError.UpgradeResponseCanceled,
+                    StreamCopyResult.InputError => request ? ProxyError.UpgradeRequestClient : ProxyError.UpgradeResponseDestination,
+                    StreamCopyResult.OutputError => request ? ProxyError.UpgradeRequestDestination : ProxyError.UpgradeResponseClient,
+                    StreamCopyResult.Canceled => request ? ProxyError.UpgradeRequestCanceled : ProxyError.UpgradeResponseCanceled,
                     _ => throw new NotImplementedException(result.ToString()),
                 };
-                ReportProxyError(context, error, exception);
+                return ReportProxyError(context, error, exception);
             }
         }
 
@@ -552,7 +659,7 @@ namespace Yarp.ReverseProxy.Service.Proxy
             return (StreamCopyResult.Success, null);
         }
 
-        private async Task HandleResponseBodyErrorAsync(HttpContext context, StreamCopyHttpContent requestContent, StreamCopyResult responseBodyCopyResult, Exception responseBodyException)
+        private async ValueTask<ProxyError> HandleResponseBodyErrorAsync(HttpContext context, StreamCopyHttpContent requestContent, StreamCopyResult responseBodyCopyResult, Exception responseBodyException)
         {
             if (requestContent?.ConsumptionTask.IsCompleted == true)
             {
@@ -561,8 +668,7 @@ namespace Yarp.ReverseProxy.Service.Proxy
                 // Check for request body errors, these may have triggered the response error.
                 if (requestBodyCopyResult != StreamCopyResult.Success)
                 {
-                    HandleRequestBodyFailure(context, requestBodyCopyResult, requestBodyError, responseBodyException);
-                    return;
+                    return HandleRequestBodyFailure(context, requestBodyCopyResult, requestBodyError, responseBodyException);
                 }
             }
 
@@ -580,18 +686,28 @@ namespace Yarp.ReverseProxy.Service.Proxy
                 // Nothing has been sent to the client yet, we can still send a good error response.
                 context.Response.Clear();
                 context.Response.StatusCode = StatusCodes.Status502BadGateway;
-                return;
+                return error;
             }
 
             // The response has already started, we must forcefully terminate it so the client doesn't get the
             // the mistaken impression that the truncated response is complete.
             ResetOrAbort(context, isCancelled: responseBodyCopyResult == StreamCopyResult.Canceled);
+
+            return error;
         }
 
-        private static Task CopyResponseTrailingHeadersAsync(HttpResponseMessage source, HttpContext context, HttpTransformer transformer)
+        private static void CopyResponseTrailingHeaders(HttpResponseMessage source, HttpContext context)
         {
-            // Copies trailers
-            return transformer.TransformResponseTrailersAsync(context, source);
+            // NOTE: Deliberately not using `context.Response.SupportsTrailers()`, `context.Response.AppendTrailer(...)`
+            // because they lookup `IHttpResponseTrailersFeature` for every call. Here we do it just once instead.
+            var responseTrailersFeature = context.Features.Get<IHttpResponseTrailersFeature>();
+            var outgoingTrailers = responseTrailersFeature?.Trailers;
+            if (outgoingTrailers != null && !outgoingTrailers.IsReadOnly)
+            {
+                // Note that trailers, if any, should already have been declared in Proxy's response
+                // by virtue of us having proxied all response headers in step 6.
+                RequestUtilities.CopyResponseHeaders(context, source.TrailingHeaders, outgoingTrailers);
+            }
         }
 
 
@@ -629,11 +745,12 @@ namespace Yarp.ReverseProxy.Service.Proxy
             }
         }
 
-        private void ReportProxyError(HttpContext context, ProxyError error, Exception ex)
+        private ProxyError ReportProxyError(HttpContext context, ProxyError error, Exception ex)
         {
             context.Features.Set<IProxyErrorFeature>(new ProxyErrorFeature(error, ex));
             Log.ErrorProxying(_logger, error, ex);
             ProxyTelemetry.Log.ProxyFailed(error);
+            return error;
         }
 
         private static void ResetOrAbort(HttpContext context, bool isCancelled)

@@ -69,10 +69,10 @@ namespace Yarp.ReverseProxy.Service.Proxy
         public virtual Task TransformResponseAsync(HttpContext httpContext, HttpResponseMessage proxyResponse)
         {
             var responseHeaders = httpContext.Response.Headers;
-            CopyResponseHeaders(httpContext, proxyResponse.Headers, responseHeaders);
+            RequestUtilities.CopyResponseHeaders(httpContext, proxyResponse.Headers, responseHeaders);
             if (proxyResponse.Content != null)
             {
-                CopyResponseHeaders(httpContext, proxyResponse.Content.Headers, responseHeaders);
+                RequestUtilities.CopyResponseHeaders(httpContext, proxyResponse.Content.Headers, responseHeaders);
             }
 
             return Task.CompletedTask;
@@ -94,28 +94,10 @@ namespace Yarp.ReverseProxy.Service.Proxy
             {
                 // Note that trailers, if any, should already have been declared in Proxy's response
                 // by virtue of us having proxied all response headers in step 6.
-                CopyResponseHeaders(httpContext, proxyResponse.TrailingHeaders, outgoingTrailers);
+                RequestUtilities.CopyResponseHeaders(httpContext, proxyResponse.TrailingHeaders, outgoingTrailers);
             }
 
             return Task.CompletedTask;
-        }
-
-
-        private static void CopyResponseHeaders(HttpContext httpContext, HttpHeaders source, IHeaderDictionary destination)
-        {
-            var isHttp2OrGreater = ProtocolHelper.IsHttp2OrGreater(httpContext.Request.Protocol);
-
-            foreach (var header in source)
-            {
-                var headerName = header.Key;
-                if (RequestUtilities.ShouldSkipResponseHeader(headerName, isHttp2OrGreater))
-                {
-                    continue;
-                }
-
-                Debug.Assert(header.Value is string[]);
-                destination.Append(headerName, header.Value as string[] ?? header.Value.ToArray());
-            }
         }
     }
 }

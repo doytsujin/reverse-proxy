@@ -90,7 +90,7 @@ namespace Yarp.ReverseProxy.Service.Proxy.Tests
                     var capturedContentText = StreamToString(capturedRequestContent);
                     Assert.Equal("request content", capturedContentText);
 
-                    var response = new HttpResponseMessage((HttpStatusCode)234);
+                    var response = new HttpResponseMessage((HttpStatusCode)234) { RequestMessage = request };
                     response.ReasonPhrase = "Test Reason Phrase";
                     response.Headers.TryAddWithoutValidation("x-ms-response-test", "response");
                     response.Content = new StreamContent(StringToStream("response content"));
@@ -414,6 +414,7 @@ namespace Yarp.ReverseProxy.Service.Proxy.Tests
                     Assert.Null(request.Content);
 
                     var response = new HttpResponseMessage((HttpStatusCode)234);
+                    response.RequestMessage = request;
                     response.ReasonPhrase = "Test Reason Phrase";
                     response.Headers.TryAddWithoutValidation("x-ms-response-test", "response");
                     response.Content = new StreamContent(StringToStream("response content"));
@@ -560,7 +561,11 @@ namespace Yarp.ReverseProxy.Service.Proxy.Tests
 
                     Assert.Null(request.Content);
 
-                    var response = new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(Array.Empty<byte>()) };
+                    var response = new HttpResponseMessage(HttpStatusCode.OK)
+                    {
+                        RequestMessage = request,
+                        Content = new ByteArrayContent(Array.Empty<byte>())
+                    };
                     return Task.FromResult(response);
                 });
 
@@ -593,7 +598,11 @@ namespace Yarp.ReverseProxy.Service.Proxy.Tests
                     // Must consume the body
                     await request.Content.CopyToAsync(Stream.Null);
 
-                    return new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(Array.Empty<byte>()) };
+                    return new HttpResponseMessage(HttpStatusCode.OK)
+                    {
+                        RequestMessage = request,
+                        Content = new ByteArrayContent(Array.Empty<byte>())
+                    };
                 });
 
             await sut.ProxyAsync(httpContext, destinationPrefix, client);
@@ -637,7 +646,11 @@ namespace Yarp.ReverseProxy.Service.Proxy.Tests
                     var cookie = Assert.Single(cookieHeaders);
                     Assert.Equal(expectedCookieString, cookie);
 
-                    var response = new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(Array.Empty<byte>()) };
+                    var response = new HttpResponseMessage(HttpStatusCode.OK)
+                    {
+                        RequestMessage = request,
+                        Content = new ByteArrayContent(Array.Empty<byte>())
+                    };
                     return Task.FromResult(response);
                 });
 
@@ -676,7 +689,10 @@ namespace Yarp.ReverseProxy.Service.Proxy.Tests
                     Assert.Equal("GET", request.Method.Method, StringComparer.OrdinalIgnoreCase);
                     Assert.Null(request.Content);
 
-                    var response = new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(Array.Empty<byte>()) };
+                    var response = new HttpResponseMessage(HttpStatusCode.OK) {
+                        Content = new ByteArrayContent(Array.Empty<byte>()),
+                        RequestMessage = request,
+                    };
                     return Task.FromResult(response);
                 });
 
@@ -1111,6 +1127,7 @@ namespace Yarp.ReverseProxy.Service.Proxy.Tests
                 {
                     var message = new HttpResponseMessage()
                     {
+                        RequestMessage = request,
                         Content = new StreamContent(new ThrowStream(throwOnFirstRead: true))
                     };
                     message.Headers.AcceptRanges.Add("bytes");
@@ -1150,6 +1167,7 @@ namespace Yarp.ReverseProxy.Service.Proxy.Tests
                 {
                     var message = new HttpResponseMessage()
                     {
+                        RequestMessage = request,
                         Content = new StreamContent(new ThrowStream(throwOnFirstRead: false))
                     };
                     message.Headers.AcceptRanges.Add("bytes");
@@ -1190,6 +1208,7 @@ namespace Yarp.ReverseProxy.Service.Proxy.Tests
                 {
                     var message = new HttpResponseMessage()
                     {
+                        RequestMessage = request,
                         Content = new StreamContent(new MemoryStream(new byte[1]))
                     };
                     message.Headers.AcceptRanges.Add("bytes");
@@ -1230,6 +1249,7 @@ namespace Yarp.ReverseProxy.Service.Proxy.Tests
                 {
                     var message = new HttpResponseMessage()
                     {
+                        RequestMessage = request,
                         Content = new StreamContent(new MemoryStream(new byte[1]))
                     };
                     message.Headers.AcceptRanges.Add("bytes");
@@ -1270,6 +1290,7 @@ namespace Yarp.ReverseProxy.Service.Proxy.Tests
                 {
                     var message = new HttpResponseMessage()
                     {
+                        RequestMessage = request,
                         Content = new StreamContent(new MemoryStream(new byte[1]))
                     };
                     message.Headers.AcceptRanges.Add("bytes");
@@ -1317,6 +1338,7 @@ namespace Yarp.ReverseProxy.Service.Proxy.Tests
                     // Make sure the request isn't canceled until the response finishes copying.
                     return Task.FromResult(new HttpResponseMessage()
                     {
+                        RequestMessage = request,
                         Content = new StreamContent(new OnCompletedReadStream(() =>
                         {
                             longTokenSource.Cancel();
@@ -1362,6 +1384,7 @@ namespace Yarp.ReverseProxy.Service.Proxy.Tests
                     // Make sure the request isn't canceled until the response finishes copying.
                     return Task.FromResult(new HttpResponseMessage()
                     {
+                        RequestMessage = request,
                         Content = new StreamContent(new OnCompletedReadStream(() => waitTcs.SetResult(0)))
                     });
                 });
@@ -1403,6 +1426,7 @@ namespace Yarp.ReverseProxy.Service.Proxy.Tests
                     // Make sure the request isn't canceled until the response finishes copying.
                     return Task.FromResult(new HttpResponseMessage()
                     {
+                        RequestMessage = request,
                         Content = new StreamContent(new OnCompletedReadStream(() => waitTcs.SetResult(0)))
                     });
                 });
@@ -1452,6 +1476,7 @@ namespace Yarp.ReverseProxy.Service.Proxy.Tests
                     Assert.Null(request.Content);
 
                     var response = new HttpResponseMessage(HttpStatusCode.SwitchingProtocols);
+                    response.RequestMessage = request;
                     upstreamStream = new DuplexStream(
                         readStream: new StallStream(ct =>
                         {
@@ -1573,6 +1598,7 @@ namespace Yarp.ReverseProxy.Service.Proxy.Tests
                 {
                     await Task.Yield();
                     var response = new HttpResponseMessage(HttpStatusCode.OK);
+                    response.RequestMessage = request;
                     response.Content = new StringContent("Foo");
                     response.Headers.Add(responseHeaderName, "Bar");
                     return response;

@@ -4,7 +4,9 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Linq;
 using System.Net.Http;
+using System.Net.Http.Headers;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Primitives;
 using Microsoft.Net.Http.Headers;
@@ -55,6 +57,27 @@ namespace Yarp.ReverseProxy.Utilities
             return new Uri(targetAddress, UriKind.Absolute);
         }
 
+        internal static void CopyRequestHeaders(HttpContext httpContext, HttpRequestMessage proxyRequest)
+        {
+            foreach (var header in httpContext.Request.Headers)
+            {
+                var headerName = header.Key;
+                var headerValue = header.Value;
+                if (StringValues.IsNullOrEmpty(headerValue))
+                {
+                    continue;
+                }
+
+                // Filter out HTTP/2 pseudo headers like ":method" and ":path", those go into other fields.
+                if (headerName.Length > 0 && headerName[0] == ':')
+                {
+                    continue;
+                }
+
+                AddHeader(proxyRequest, headerName, headerValue);
+            }
+        }
+
         // Note: HttpClient.SendAsync will end up sending the union of
         // HttpRequestMessage.Headers and HttpRequestMessage.Content.Headers.
         // We don't really care where the proxied headers appear among those 2,
@@ -91,6 +114,33 @@ namespace Yarp.ReverseProxy.Utilities
                     // https://github.com/microsoft/reverse-proxy/issues/618
                     // Debug.Assert(added.GetValueOrDefault(), $"A header was dropped; {headerName}: {string.Join(", ", headerValues)}");
                 }
+            }
+        }
+
+        internal static void CopyResponseHeaders(HttpContext httpContext, HttpResponseMessage proxyResponse)
+        {
+            var responseHeaders = httpContext.Response.Headers;
+            CopyResponseHeaders(httpContext, proxyResponse.Headers, responseHeaders);
+            if (proxyResponse.Content != null)
+            {
+                CopyResponseHeaders(httpContext, proxyResponse.Content.Headers, responseHeaders);
+            }
+        }
+
+        internal static void CopyResponseHeaders(HttpContext httpContext, HttpHeaders source, IHeaderDictionary destination)
+        {
+            var isHttp2OrGreater = ProtocolHelper.IsHttp2OrGreater(httpContext.Request.Protocol);
+
+            foreach (var header in source)
+            {
+                var headerName = header.Key;
+                if (ShouldSkipResponseHeader(headerName, isHttp2OrGreater))
+                {
+                    continue;
+                }
+
+                Debug.Assert(header.Value is string[]);
+                destination.Append(headerName, header.Value as string[] ?? header.Value.ToArray());
             }
         }
     }
